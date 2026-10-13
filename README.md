@@ -161,3 +161,238 @@ sequenceDiagram
 
 ## 6. Використання AI
 Для генерації ідей, архітектури та вимог використано Gemini (gemini.google.com). Основні промпти: пошук унікальної цінності й порівняння з аналогами, визначення MVP-скоупу, генерація user stories, Mermaid-діаграм, функціональних і нефункціональних вимог, acceptance criteria та MoSCoW.
+
+---
+
+# Lab 2. Базова реалізація мобільного AI-застосунку «Дієтокс»
+
+Працюючий MVP: **Android (Kotlin + Compose) → HTTP API → backend (Python + FastAPI) → AI-компонент → результат у UI**
+зі станами `Idle / Loading / Success / Error`.
+
+## 1. Сценарій (Task 1)
+
+> **Як** користувач (16-60 років) **я хочу** ввести свої параметри (вік, стать, вага, зріст, активність, ціль, продукти-винятки)
+> **щоб** отримати свою добову норму калорій і AI-план харчування на день.
+
+**Чому саме він.** Це «зерно» продукту з Lab 1 (FR1-FR3 з MVP): без нього застосунок не має сенсу, а решта фіч (фото, графіки,
+нагадування) від нього залежать. Сценарій починається дією користувача (форма) і завершується корисним результатом
+(норма + 4 прийоми їжі з калоріями). Він покриває всі шари: UI → мережа → backend з валідацією → AI → UI.
+
+## 2. Архітектура та дані (Task 2)
+
+```mermaid
+sequenceDiagram
+    actor U as Користувач
+    participant App as Android (Compose + ViewModel)
+    participant API as FastAPI backend
+    participant AI as AI-компонент (infer)
+    participant G as Gemini API (опційно)
+    U->>App: Вводить дані, натискає "Створити план"
+    App->>App: Клієнтська валідація
+    App->>API: POST /plan (JSON)
+    API->>API: Pydantic-валідація, розрахунок норми (Міффлін-Сан Жеор)
+    API->>AI: infer(payload)
+    AI->>G: промпт (якщо задано GEMINI_API_KEY)
+    G-->>AI: JSON-план
+    AI->>AI: перевірка: структура, винятки, відхилення калорій <= 10%
+    AI-->>API: план (або fallback: rule-based)
+    API-->>App: 200 OK + JSON
+    App-->>U: норма + план (або повідомлення про помилку + Retry)
+```
+
+**Вхідні дані `POST /plan`**
+
+| Поле | Тип | Обов'язкове | Обмеження |
+|---|---|---|---|
+| `age` | int | так | 16-60 |
+| `sex` | string | так | `male` / `female` |
+| `weight_kg` | number | так | 30-250 |
+| `height_cm` | number | так | 120-230 |
+| `activity` | string | так | `sedentary` / `light` / `moderate` / `high` |
+| `goal` | string | так | `lose` / `maintain` / `gain` |
+| `excluded` | string[] | ні | до 10 елементів, до 40 символів кожен |
+
+**Успішна відповідь (200):** `calories {bmr, tdee, target}`, `meals[] {name, items[] {name, grams, kcal}, kcal}`,
+`total_kcal`, `deviation_pct`, `source` (`gemini` | `rule-based`), `warnings[]`, `disclaimer`.
+
+**Помилки** (єдиний формат `{"error": {"code": "...", "message": "..."}}`, без stack trace):
+
+| Де | Ситуація | Код / поведінка |
+|---|---|---|
+| Mobile | порожні/некоректні поля | запит не надсилається, повідомлення під полем |
+| Mobile | backend недоступний / таймаут | стан Error + кнопка «Спробувати ще раз» |
+| Mobile | JSON неповний або зламаний | стан Error («некоректна відповідь»), без краху |
+| Backend | невалідні дані | `422 VALIDATION_ERROR` |
+| Backend | неможливо скласти план з такими винятками | `422 PLAN_IMPOSSIBLE` |
+| Backend | внутрішня помилка | `500 INTERNAL_ERROR` |
+| AI | Gemini недоступний / невалідна відповідь | контрольований fallback на rule-based + `warnings` |
+
+## 3. Структура репозиторію
+
+```
+Lab1/
+├── app/                      # Android-застосунок
+│   └── src/main/java/com/example/lab1/
+│       ├── MainActivity.kt
+│       ├── data/             # ApiConfig, ApiModels (DTO), DietoxApi (Retrofit), PlanRepository
+│       └── ui/               # PlanViewModel (UiState), PlanScreen (Compose + Preview)
+│   └── src/test/.../PlanViewModelTest.kt
+├── backend/                  # FastAPI
+│   ├── app/                  # main.py, schemas.py, calc.py, foods.py, planner.py, ai.py
+│   ├── tests/test_core.py
+│   ├── tools/ai_validation.py
+│   ├── examples/*.json       # приклади запитів/відповідей
+│   ├── requirements.txt
+│   └── .env.example
+└── screenshots/
+```
+
+## 4. Запуск backend
+
+Потрібен Python 3.11+. З кореня репозиторію (Windows, PowerShell):
+
+```powershell
+cd backend
+python -m venv .venv
+.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+copy .env.example .env
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+```
+
+Перевірка: `http://localhost:8000/health` → `{"status":"ok"}`, Swagger UI: `http://localhost:8000/docs`.
+
+**AI-режими.** Без ключа працює базовий алгоритм (`source: "rule-based"`). Щоб увімкнути Gemini, впишіть ключ у `backend/.env`
+(`GEMINI_API_KEY=...`, ключ з aistudio.google.com). Файл `.env` у `.gitignore` -- ключ у репозиторій не потрапляє.
+
+## 5. Запуск mobile
+
+1. Відкрийте проєкт у Android Studio. У `app/build.gradle.kts` у блок `dependencies { }` додайте:
+   ```kotlin
+   implementation("com.squareup.retrofit2:retrofit:2.11.0")
+   implementation("com.squareup.retrofit2:converter-gson:2.11.0")
+   implementation("com.squareup.okhttp3:okhttp:4.12.0")
+   implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.7")
+   testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+   ```
+2. У `app/src/main/AndroidManifest.xml`: перед `<application>` додайте
+   `<uses-permission android:name="android.permission.INTERNET" />` та
+   `<uses-permission android:name="android.permission.ACCESS_LOCAL_NETWORK" />`,
+   а в тег `<application ...>` -- атрибут `android:usesCleartextTraffic="true"` (локальний HTTP без TLS, тільки для розробки).
+   `ACCESS_LOCAL_NETWORK` потрібен на Android 17 (API 37): без нього підключення до backend у локальній мережі
+   (`10.0.2.2`) завершується `SocketTimeoutException`. Якщо запит усе одно не проходить, видайте дозвіл
+   у налаштуваннях застосунку (App info → Permissions).
+3. **Адреса backend** -- файл `data/ApiConfig.kt`:
+  - емулятор: `http://10.0.2.2:8000/` (значення за замовчуванням; `10.0.2.2` = localhost комп'ютера);
+  - фізичний телефон: `http://<IP комп'ютера в Wi-Fi>:8000/` (дізнатися: `ipconfig`), телефон і ПК -- в одній мережі;
+    у Windows дозвольте порт 8000 у брандмауері.
+4. Sync Gradle → вибрати пристрій → **Run ▶**.
+
+## 6. Приклади API
+
+```powershell
+curl.exe http://localhost:8000/health
+curl.exe -X POST http://localhost:8000/plan -H "Content-Type: application/json" -d "@backend/examples/valid.json"
+```
+
+Запит (`examples/valid.json`):
+```json
+{"age": 25, "sex": "female", "weight_kg": 60, "height_cm": 165, "activity": "moderate", "goal": "maintain", "excluded": ["молоко"]}
+```
+Відповідь: `backend/examples/valid.response.json` (норма 2085 ккал, план 2094 ккал, відхилення 0,4%).
+
+Некоректний запит (`examples/invalid.json`, вік 15 і невірна стать) → `422`:
+```json
+{"error": {"code": "VALIDATION_ERROR", "message": "Некоректні дані у полях: age, sex"}}
+```
+
+## 7. Перевірка AI-функції (5 вхідних прикладів)
+
+Скрипт: `python backend/tools/ai_validation.py`. Режим -- rule-based (без ключа Gemini).
+
+| № | Вхід | Очікуваний результат | Фактичний результат | Час | Висновок |
+|---|---|---|---|---|---|
+| 1 | Жінка 25 р., 60 кг, 165 см, помірна, підтримка | норма ≈ 2085, план ±10% | норма 2085, план 2073 ккал (0,6%) | <1 мс | ✔ |
+| 2 | Чоловік 35 р., 95 кг, 182 см, легка, схуднення | дефіцит 15% | норма 2241, план 2232 ккал (0,4%) | <1 мс | ✔ |
+| 3 | Дівчина 17 р., схуднення | дефіцит не застосовується, є попередження | норма 2387, план 2384 ккал (0,1%), попередження | <1 мс | ✔ |
+| 4 | Чоловік 28 р., набір, виняток: молоко, горіхи | немає молочного/горіхів | норма 3183, план 3176 ккал (0,2%), порушень немає | <1 мс | ✔ |
+| 5 | Жінка 55 р., 42 кг, виняток: риба, глютен | норма не нижче 1200, винятків немає | норма 1200 (підняте до мінімуму), план 1188 ккал (1,0%) | <1 мс | ✔ |
+
+Для Gemini-режиму додатково перевіряється: коректна JSON-структура, відсутність заборонених продуктів, відхилення калорій ≤ 10%;
+інакше -- fallback. Це покрито тестами з підміною клієнта Gemini (`tests/test_core.py`). Реальні запити до Gemini у цій перевірці **не виконувались**.
+
+## 8. Обов'язкові перевірки
+
+| Сценарій | Очікувана поведінка | Як перевірено |
+|---|---|---|
+| Коректні дані | backend повертає план, mobile його показує | скриншот `screenshots/lab2-success.png` (додати); `tests/test_core.py` |
+| Порожні дані | запит не надсилається, зрозуміле повідомлення | `PlanViewModelTest.emptyForm_...`; `examples/empty.json` → 422 |
+| Backend недоступний | loading завершується, помилка + «Спробувати ще раз» | зупинити uvicorn → скриншот `lab2-error.png` (додати) |
+| AI повернув помилку | контрольована відповідь без технічних секретів | `AiTests.test_gemini_error_falls_back` |
+| Неправильний JSON | клієнт не падає, повідомлення | `PlanViewModelTest.mapper_rejectsBrokenResponse`, `AiTests.test_gemini_bad_json_falls_back` |
+| Повторний запит | новий результат без перезапуску | `PlanViewModelTest.error_thenRetry_...`; повторне натискання дає інший план |
+
+## 9. Тести
+
+```powershell
+cd backend ; $env:PYTHONPATH="." ; python -m unittest discover -s tests -v     # 17 тестів backend
+./gradlew testDebugUnitTest                                                      # тести ViewModel (з кореня проєкту)
+```
+
+## 10. Безпека
+
+- API-ключ Gemini тільки в змінних середовища (`.env` в `.gitignore`), у коді та репозиторії ключів немає.
+- Клієнту не віддається stack trace -- лише `{error: {code, message}}`; деталі -- тільки в лозі сервера.
+- Реальні персональні/медичні дані не використовуються: вводяться лише параметри, потрібні для розрахунку; permissions -- лише `INTERNET` та `ACCESS_LOCAL_NETWORK` (доступ до локального backend на Android 17).
+- Незашифрований HTTP дозволено лише для локальної розробки.
+
+## 11. Обмеження поточної версії
+
+- Немає збереження профілю/щоденника (Room із Lab 1 не реалізовано), немає заміни окремої страви, фото та нагадувань (V1+).
+- Базовий алгоритм використовує невелику базу з ~26 продуктів і фіксовані шаблони страв; порції можуть виглядати незвично великими.
+- Не медичний сервіс: рекомендації орієнтовні. Для віку до 18 років дефіцит калорій не застосовується.
+- Backend запускається локально; HTTPS, автентифікація й хостинг не реалізовані.
+
+## 12. Зміни щодо архітектури з Lab 1
+
+- Замість Firebase Cloud Functions використано **FastAPI** (Python) -- простіше запускати локально й перевіряти через Swagger/curl.
+- Gemini викликається з backend напряму через REST, **з обов'язковим fallback**, щоб застосунок працював без ключа й мережі до AI.
+- Спрощено клієнт: ViewModel + Repository без Hilt; локальна база Room перенесена на наступну лабораторну.
+
+## 13. Скриншоти
+
+**Swagger UI: POST /plan**
+
+![Swagger](screenshots/lab2-swagger.png)
+
+**Початковий екран**
+
+![Idle](screenshots/lab2-idle.png)
+
+**Стан Loading**
+
+![Loading](screenshots/lab2-loading.png)
+
+**Перевірка порожніх даних**
+
+![Validation](screenshots/lab2-validation.png)
+
+**Backend недоступний (стан Error)**
+
+![Error](screenshots/lab2-error.png)
+
+**Успішний сценарій (план харчування)**
+
+![Success](screenshots/lab2-success.png)
+
+## 14. Використання AI
+
+Для виконання Лаби 2 використано AI-асистента (Claude) як інструмент розробки:
+
+- уточнення сценарію (розрахунок норми калорій і AI-план харчування) та структури API;
+- підготовка чернетки backend на FastAPI (валідація, розрахунок за формулою Міффліна–Сан Жеора, AI-компонент із fallback) і Android-коду (Compose, ViewModel, Retrofit, стани UI);
+- допомога в налагодженні: помилка «Сервер недоступний» діагностована через Logcat (`SocketTimeoutException` до `10.0.2.2:8000`) і усунена додаванням дозволу `ACCESS_LOCAL_NETWORK` для Android 17.
+
+Згенерований код розглядався як чернетка: backend запущено локально й перевірено через Swagger UI та автотести (17 тестів), застосунок зібрано в Android Studio й перевірено на емуляторі Pixel 10a (сценарії: коректні дані, порожні дані, backend недоступний, повторний запит).
+
+Gemini у цій лабораторній роботі не використовувався.
